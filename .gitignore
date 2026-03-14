@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# CFFI compiled extension
+bytediff/cffi_ext/_tape_ext*.so
+bytediff/cffi_ext/_tape_ext*.c
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Benchmarks output
+benchmarks/*.json
+benchmarks/*.csv
+
+# macOS
+.DS_Store
