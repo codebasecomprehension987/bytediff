@@ -1,136 +1,170 @@
 """
-Tests for the VJP registry — ensures each registered primitive has
-mathematically correct derivatives, verified against finite differences.
+VJP (vector-Jacobian product) registry for Python primitive operations.
+
+Each entry maps an operator symbol to a tuple:
+    (primal_fn, vjp_factory)
+
+where ``vjp_factory(primals) -> vjp_fn`` returns a closure that accepts
+a cotangent scalar and returns a tuple of cotangents for each input.
+
+This is the mathematical heart of bytediff.  Every differentiable operator
+intercepted in the bytecode must have a registered VJP here.
 """
 
+from __future__ import annotations
+
 import math
-import pytest
-from bytediff.bytecode.vjp_registry import lookup, lookup_math, has_vjp
+from typing import Callable, Dict, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+
+Primals = tuple
+CotangentIn = float
+CotangentOut = Tuple[float, ...]
+VJPFn = Callable[[CotangentIn], CotangentOut]
+VJPFactory = Callable[[Primals], VJPFn]
+PrimalFn = Callable[..., float]
+
+_registry: Dict[str, Tuple[PrimalFn, VJPFactory]] = {}
 
 
-EPS = 1e-6
-RTOL = 1e-4  # relative tolerance for FD comparisons
+def register(op: str, primal_fn: PrimalFn, vjp_factory: VJPFactory) -> None:
+    """Register a primitive VJP."""
+    _registry[op] = (primal_fn, vjp_factory)
 
 
-def finite_diff_binary(op_fn, x, y, eps=EPS):
-    """Return (df/dx, df/dy) via central finite differences."""
-    dfdx = (op_fn(x + eps, y) - op_fn(x - eps, y)) / (2 * eps)
-    dfdy = (op_fn(x, y + eps) - op_fn(x, y - eps)) / (2 * eps)
-    return dfdx, dfdy
+def lookup(op: str) -> Optional[Tuple[PrimalFn, VJPFactory]]:
+    """Return the (primal_fn, vjp_factory) for ``op``, or None."""
+    return _registry.get(op)
 
 
-def finite_diff_unary(op_fn, x, eps=EPS):
-    return (op_fn(x + eps) - op_fn(x - eps)) / (2 * eps)
+def has_vjp(op: str) -> bool:
+    return op in _registry
 
 
-class TestBinaryVJPs:
-    @pytest.mark.parametrize("op,x,y", [
-        ("+",  3.0, 4.0),
-        ("+",  -1.0, 2.5),
-        ("-",  5.0, 3.0),
-        ("-",  0.0, 1.0),
-        ("*",  2.0, 7.0),
-        ("*",  -3.0, 4.0),
-        ("/",  6.0, 2.0),
-        ("/",  1.0, 3.0),
-        ("**", 2.0, 3.0),
-        ("**", 3.0, 2.0),
-    ])
-    def test_vjp_matches_finite_diff(self, op, x, y):
-        entry = lookup(op)
-        assert entry is not None, f"No VJP registered for '{op}'"
-        primal_fn, vjp_factory = entry
+# ---------------------------------------------------------------------------
+# Binary arithmetic VJPs
+# ---------------------------------------------------------------------------
 
-        # Forward
-        result = primal_fn(x, y)
+# Addition: f(x,y) = x + y
+# df/dx = 1, df/dy = 1
+register(
+    "+",
+    primal_fn=lambda x, y: x + y,
+    vjp_factory=lambda primals: (lambda g: (g, g)),
+)
 
-        # VJP with seed g=1
-        vjp_fn = vjp_factory((x, y))
-        dx, dy = vjp_fn(1.0)
+register(
+    "+=",
+    primal_fn=lambda x, y: x + y,
+    vjp_factory=lambda primals: (lambda g: (g, g)),
+)
 
-        # Finite difference reference
-        fd_dx, fd_dy = finite_diff_binary(primal_fn, x, y)
+# Subtraction: f(x,y) = x - y
+# df/dx = 1, df/dy = -1
+register(
+    "-",
+    primal_fn=lambda x, y: x - y,
+    vjp_factory=lambda primals: (lambda g: (g, -g)),
+)
 
-        assert dx == pytest.approx(fd_dx, rel=RTOL, abs=1e-8), \
-            f"{op}: dx={dx} != fd_dx={fd_dx}"
-        assert dy == pytest.approx(fd_dy, rel=RTOL, abs=1e-8), \
-            f"{op}: dy={dy} != fd_dy={fd_dy}"
+register(
+    "-=",
+    primal_fn=lambda x, y: x - y,
+    vjp_factory=lambda primals: (lambda g: (g, -g)),
+)
 
-    def test_vjp_linearity_with_seed(self):
-        """VJP(g) = g * VJP(1) for all g."""
-        entry = lookup("*")
-        assert entry is not None
-        _, vjp_factory = entry
-        x, y = 3.0, 5.0
-        vjp_fn = vjp_factory((x, y))
-        dx1, dy1 = vjp_fn(1.0)
-        for g in [0.5, 2.0, -1.0, 100.0]:
-            dxg, dyg = vjp_fn(g)
-            assert dxg == pytest.approx(g * dx1, rel=1e-12)
-            assert dyg == pytest.approx(g * dy1, rel=1e-12)
+# Multiplication: f(x,y) = x * y
+# df/dx = y, df/dy = x
+def _mul_vjp(primals):
+    x, y = primals
+    return lambda g: (g * y, g * x)
 
-    def test_addition_vjp_is_identity(self):
-        entry = lookup("+")
-        _, vjp_factory = entry
-        for x, y in [(1.0, 2.0), (-5.0, 3.0), (0.0, 0.0)]:
-            vjp_fn = vjp_factory((x, y))
-            dx, dy = vjp_fn(1.0)
-            assert dx == 1.0
-            assert dy == 1.0
+register("*",  primal_fn=lambda x, y: x * y,  vjp_factory=_mul_vjp)
+register("*=", primal_fn=lambda x, y: x * y,  vjp_factory=_mul_vjp)
 
-    def test_subtraction_vjp_signs(self):
-        entry = lookup("-")
-        _, vjp_factory = entry
-        vjp_fn = vjp_factory((5.0, 3.0))
-        dx, dy = vjp_fn(1.0)
-        assert dx == 1.0
-        assert dy == -1.0
+# True division: f(x,y) = x / y
+# df/dx = 1/y, df/dy = -x/y^2
+def _div_vjp(primals):
+    x, y = primals
+    return lambda g: (g / y, -g * x / (y * y))
 
-    def test_floor_div_vjp_zero(self):
-        entry = lookup("//")
-        _, vjp_factory = entry
-        vjp_fn = vjp_factory((7.0, 2.0))
-        dx, dy = vjp_fn(1.0)
-        assert dx == 0.0
-        assert dy == 0.0
+register("/", primal_fn=lambda x, y: x / y, vjp_factory=_div_vjp)
 
-    def test_has_vjp(self):
-        for op in ("+", "-", "*", "/", "**", "//", "%"):
-            assert has_vjp(op), f"Expected VJP for '{op}'"
-        assert not has_vjp("BITWISE_AND")
+# Power: f(x,y) = x ** y
+# df/dx = y * x^(y-1), df/dy = x^y * ln(x)
+def _pow_vjp(primals):
+    x, y = primals
+    result = x ** y
+    def vjp(g):
+        dx = g * y * (x ** (y - 1)) if x != 0 else 0.0
+        dy = g * result * math.log(abs(x)) if x > 0 else 0.0
+        return (dx, dy)
+    return vjp
+
+register("**",  primal_fn=lambda x, y: x ** y, vjp_factory=_pow_vjp)
+register("**=", primal_fn=lambda x, y: x ** y, vjp_factory=_pow_vjp)
+
+# Floor division: non-differentiable everywhere, return zero gradients
+register(
+    "//",
+    primal_fn=lambda x, y: x // y,
+    vjp_factory=lambda primals: (lambda g: (0.0, 0.0)),
+)
+
+# Modulo: df/dx = 1, df/dy ≈ 0 (non-smooth, zero for now)
+register(
+    "%",
+    primal_fn=lambda x, y: x % y,
+    vjp_factory=lambda primals: (lambda g: (g, 0.0)),
+)
+
+# ---------------------------------------------------------------------------
+# Unary VJPs
+# ---------------------------------------------------------------------------
+
+# Negation: f(x) = -x, df/dx = -1
+register(
+    "UNARY_NEGATIVE",
+    primal_fn=lambda x: -x,
+    vjp_factory=lambda primals: (lambda g: (-g,)),
+)
+
+# Unary positive: f(x) = x, df/dx = 1
+register(
+    "UNARY_POSITIVE",
+    primal_fn=lambda x: +x,
+    vjp_factory=lambda primals: (lambda g: (g,)),
+)
+
+# ---------------------------------------------------------------------------
+# Math function VJPs (for CALL interception of math.*)
+# ---------------------------------------------------------------------------
+
+_math_registry: Dict[str, Tuple[PrimalFn, VJPFactory]] = {}
 
 
-class TestUnaryVJPs:
-    @pytest.mark.parametrize("op,x", [
-        ("UNARY_NEGATIVE", 3.0),
-        ("UNARY_NEGATIVE", -5.0),
-        ("UNARY_POSITIVE", 2.5),
-    ])
-    def test_unary_vjp_correct(self, op, x):
-        entry = lookup(op)
-        assert entry is not None
-        primal_fn, vjp_factory = entry
-        vjp_fn = vjp_factory((x,))
-        (dx,) = vjp_fn(1.0)
-        fd_dx = finite_diff_unary(primal_fn, x)
-        assert dx == pytest.approx(fd_dx, rel=RTOL, abs=1e-8)
+def register_math(name: str, primal_fn: PrimalFn, vjp_factory: VJPFactory) -> None:
+    _math_registry[name] = (primal_fn, vjp_factory)
 
 
-class TestMathVJPs:
-    @pytest.mark.parametrize("fn_name,x", [
-        ("sin",  0.5),
-        ("cos",  0.5),
-        ("exp",  1.0),
-        ("log",  2.0),
-        ("sqrt", 4.0),
-        ("tanh", 0.5),
-    ])
-    def test_math_vjp_matches_fd(self, fn_name, x):
-        entry = lookup_math(fn_name)
-        assert entry is not None, f"No VJP registered for math.{fn_name}"
-        primal_fn, vjp_factory = entry
-        vjp_fn = vjp_factory((x,))
-        (dx,) = vjp_fn(1.0)
-        fd_dx = finite_diff_unary(primal_fn, x)
-        assert dx == pytest.approx(fd_dx, rel=RTOL, abs=1e-8), \
-            f"math.{fn_name}: dx={dx} != fd_dx={fd_dx}"
+def lookup_math(name: str) -> Optional[Tuple[PrimalFn, VJPFactory]]:
+    return _math_registry.get(name)
+
+
+# sin: df/dx = cos(x)
+register_math("sin", math.sin, lambda p: (lambda g: (g * math.cos(p[0]),)))
+# cos: df/dx = -sin(x)
+register_math("cos", math.cos, lambda p: (lambda g: (-g * math.sin(p[0]),)))
+# exp: df/dx = exp(x)
+register_math("exp", math.exp, lambda p: (lambda g: (g * math.exp(p[0]),)))
+# log: df/dx = 1/x
+register_math("log", math.log, lambda p: (lambda g: (g / p[0],)))
+# sqrt: df/dx = 1/(2*sqrt(x))
+register_math("sqrt", math.sqrt, lambda p: (lambda g: (g / (2 * math.sqrt(p[0])),)))
+# tanh: df/dx = 1 - tanh(x)^2
+register_math("tanh", math.tanh, lambda p: (lambda g: (g * (1 - math.tanh(p[0])**2),)))
+# atanh: df/dx = 1/(1 - x^2)
+register_math("atanh", math.atanh, lambda p: (lambda g: (g / (1 - p[0]**2),)))
